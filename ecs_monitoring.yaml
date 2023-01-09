@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  This template creates monitoring for ECS Cluster and running tasks for services.
+
+Parameters:
+  CustomerName:
+    Type: String
+    Description: Name of the Customer
+
+  SolutionName:
+    Type: String
+    Description: Solution name
+
+  EnvironmentName:
+    Description: Project Environment for Tagging Purposes
+    ConstraintDescription: "Choose an Environment from the dropdown"
+    Type: String
+    AllowedValues:
+      - "sandbox"
+      - "dev"
+      - "prod"
+
+  ComponentName:
+    Type: String
+    Description: Component name
+    Default: ECSMonitoring
+
+  LambdaFunctionS3BucketName:
+    Description: "Name of the lambda s3 bucket"
+    ConstraintDescription: "Choose s3-bucket for Lambda source code"
+    Type: String
+    AllowedValues:
+      - lambda-code-src-bucket-sandbox
+      - lambda-code-src-bucket-dev
+      - lambda-code-src-bucket-prod
+ 
+  LambdaFunctionS3Key:
+    Description: File which holds the function code
+    Type: String
+    Default: ecs_monitoring.zip
+
+  LambdaSubnet:
+    Description: Subnet for the Lambda function to use.
+    Type: List<AWS::EC2::Subnet::Id>
+
+  LambdaSG:
+    Description: Security group for the Lambda function to use.
+    Type: List<AWS::EC2::SecurityGroup::Id>
+
+Resources:
+  ECSMonitoringLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Checks status for cluster and running tasks
+      Handler: "ecs_monitoring.lambda_handler"
+      Role: !GetAtt ECSMonitoringLambdaRole.Arn
+      MemorySize: 128
+      Runtime: "python3.7"
+      FunctionName: !Ref ComponentName
+      Timeout: 5
+      VpcConfig:
+        SecurityGroupIds: !Ref LambdaSG
+        SubnetIds: !Ref LambdaSubnet
+      Tags:
+        - Key: "project"
+          Value: !Ref ComponentName
+      Code:
+        S3Bucket: !Ref LambdaFunctionS3BucketName
+        S3Key: !Ref LambdaFunctionS3Key
+
+  ECSMonitoringLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ComponentName}-LambdaRole'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowLambdaVPC
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:DeleteNetworkInterface"
+                  - "cloudwatch:PutMetricData"
+                  - "ecs:DescribeClusters"
+                  - "ecs:ListServices"
+                  - "ecs:DescribeServices"
+                  - "sns:Publish"
+                Resource: '*'
+      ManagedPolicyArns: 
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  ECSMonitoringSecretsManagerAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ComponentName}-SecretsManagerAccessPolicy'
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - kms:Decrypt
+              - secretsmanager:GetSecretValue
+            Resource: "*"
+      Roles:
+        - Ref: "ECSMonitoringLambdaRole"
+
+  ECSMonitoringRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: !Sub '${ComponentName}-Rule'
+      Description: "This rule schedules ECS Monitoring Lambda"
+      ScheduleExpression: "rate(15 minutes)"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt ECSMonitoringLambda.Arn
+          Id: ECSMonitoringLambda
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "ECSMonitoringLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ECSMonitoringRule.Arn
+
+  ECSMonitoringSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ECSMonitoringTopic
+
+  ECSMonitoringSubscriptionEmail:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ECSMonitoringSNSTopic
+      Endpoint: example@example.fi
+      Protocol: email
+  
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: MyTopicPolicy
+        Version: '2012-10-17'
+        Statement:
+        - Sid: allow-publish
+          Effect: Allow
+          Principal:
+            Service: 
+              - cloudwatch.amazonaws.com
+          Action: sns:Publish
+          Resource: "*"
+      Topics:
+      - !Ref ECSMonitoringSNSTopic
+   
+  ECSMonitoringClusterStatus:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: ECS Monitoring Cluster Status
+      AlarmName: !Sub "${CustomerName}-${SolutionName}-${EnvironmentName}-${ComponentName}-ClusterStatus"
+      Threshold: 1
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      ActionsEnabled: True
+      AlarmActions: 
+          - !Ref ECSMonitoringSNSTopic
+      OKActions:
+          - !Ref ECSMonitoringSNSTopic
+      TreatMissingData: breaching
+      Metrics:
+        - Id: ecs_clusterstatus
+          MetricStat:
+            Metric:
+              Dimensions:
+                - Name: "ECSMonitoring"
+                  Value: "Cluster"
+              MetricName: "ECSMonitoring-Cluster-status"
+              Namespace: Monitoring
+            Period: 3600 #1 hour
+            Stat: Maximum
+
+  ECSMonitoringActiveTasks:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: ECS Monitoring Running Tasks for active App
+      AlarmName: !Sub "${CustomerName}-${SolutionName}-${EnvironmentName}-${ComponentName}-RunningTasks-Active"
+      Threshold: 1
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      ActionsEnabled: True
+      AlarmActions: 
+          - !Ref ECSMonitoringSNSTopic
+      OKActions:
+          - !Ref ECSMonitoringSNSTopic
+      TreatMissingData: breaching
+      Metrics:
+        - Id: ecs_runningtasks_active
+          MetricStat:
+            Metric:
+              Dimensions:
+                - Name: "ECSMonitoring"
+                  Value: "service-active"
+              MetricName: "ECSMonitoring-RunningTasks-Active"
+              Namespace: Monitoring
+            Period: 3600 #1 hour
+            Stat: Maximum
+
+  ECSMonitoringPassiveTasks:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: ECS Monitoring Running Tasks for passive App
+      AlarmName: !Sub "${CustomerName}-${SolutionName}-${EnvironmentName}-${ComponentName}-RunningTasks-Passive"
+      Threshold: 1
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      ActionsEnabled: True
+      AlarmActions: 
+          - !Ref ECSMonitoringSNSTopic
+      OKActions:
+          - !Ref ECSMonitoringSNSTopic
+      TreatMissingData: breaching
+      Metrics:
+        - Id: ecs_runningtasks_passive
+          MetricStat:
+            Metric:
+              Dimensions:
+                - Name: "ECSMonitoring"
+                  Value: "service-passive"
+              MetricName: "ECSMonitoring-RunningTasks-Passive"
+              Namespace: Monitoring
+            Period: 3600 #1 hour
+            Stat: Maximum
+
+  ECSMonitoringCWAgentTasks:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: ECS Monitoring Running Tasks for CloudWatch Agent
+      AlarmName: !Sub "${CustomerName}-${SolutionName}-${EnvironmentName}-${ComponentName}-RunningTasks-CWAgent"
+      Threshold: 1
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      ActionsEnabled: True
+      AlarmActions: 
+          - !Ref ECSMonitoringSNSTopic
+      OKActions:
+          - !Ref ECSMonitoringSNSTopic
+      TreatMissingData: breaching
+      Metrics:
+        - Id: ecs_runningtasks_cwagent
+          MetricStat:
+            Metric:
+              Dimensions:
+                - Name: "ECSMonitoring"
+                  Value: "service-cw-agent"
+              MetricName: "ECSMonitoring-RunningTasks-CWAgent"
+              Namespace: Monitoring
+            Period: 3600 #1 hour
+            Stat: Maximum
